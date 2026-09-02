@@ -1,12 +1,18 @@
 ---
-title: "American Crocodile Scute Mercury Analyses"
+title: "American Crocodile Hg Analyses"
 author: "Kylie"
 date: "2026-09-02"
 output: html_document
+runtime: shiny
+resource_files:
+- manifest.json
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+
+
+```{r include = FALSE}
+library(shiny)
+library (viridis)
 ```
 
 # ============================================================
