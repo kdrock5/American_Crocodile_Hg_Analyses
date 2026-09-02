@@ -1,0 +1,8 @@
+"Analysis","Effect","Estimate","CI","P_value","R2_or_other"
+"All individuals: Hg ~ SVL","logSVL slope",1.406,"1.218 to 1.594","<0.0001","R2 = 0.760"
+"Juveniles: Hg ~ SVL","logSVL slope",0.83,"0.473 to 1.188","<0.0001","R2 = 0.540"
+"Hatchlings: Hg ~ SVL + clutch","logSVL slope",0.636,"-0.904 to 2.393","0.425","Marginal R2 = 0.010; conditional R2 = 0.439"
+"Hatchling clutch effect","ICC",0.479,"0.134 to 0.726",NA,"ICC = 0.479"
+"Hatchling nest site + clutch","Site omnibus",NA,NA,"0.151","Marginal R2 = 0.326; conditional R2 = 0.502"
+"Juveniles: sex-adjusted Hg","Sex",0.0449,"-0.069 to 0.159","0.420","Model R2 = 0.556"
+"Hatchling vs juvenile Hg","Juvenile:Hatchling ratio",0.423467278001496,"1.98 to 2.82","<0.0001","2.36-fold difference"

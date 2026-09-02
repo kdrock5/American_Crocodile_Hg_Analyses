@@ -43,6 +43,8 @@ library(performance)
 library(patchwork)
 library(forcats)
 library(clubSandwich)
+library(here)
+library(see)
 ```
 
 # ------------------------------------------------------------
@@ -57,9 +59,8 @@ rather than technical replicates of a homogenized sample.
 ## Import Raw Data
 
 ```{r import-data}
-raw <- read_excel(
-  "Bobby Data.xlsx",
-  sheet = "Data for Prism"
+raw <- read_xlsx(
+  here("American_Crocodile_Mercury_Data.xlsx")
 )
 ```
 
@@ -1777,5 +1778,13 @@ ggsave(
   compression = "lzw"
 )
 ```
+
+```{r manifest}
+rsconnect::writeManifest(
+  appDir = here(),
+  appPrimaryDoc = "American_Crocodile_Hg_Analyses.Rmd"
+)
+```
+
 
 
