@@ -1,0 +1,1781 @@
+---
+title: "American Crocodile Scute Mercury Analyses"
+author: "Kylie"
+date: "2026-09-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# ============================================================
+# American Crocodile Scute Mercury Analyses
+# ============================================================
+#
+# Analyses:
+#   1. Hg concentration and body size (SVL)
+#   2. Hatchling clutch and nest-site effects
+#   3. Juvenile sex effects
+#   4. Hatchling vs. juvenile Hg concentrations
+#   5. Publication figures and summary outputs
+#
+# Multiple scute subsamples from the same crocodile are averaged
+# to obtain one individual-level THg concentration before all
+# biological analyses. Because scute material could not be
+# homogenized, these are treated as spatial subsamples rather
+# than scute subsamples of a homogenized sample.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 1. PACKAGES
+# ------------------------------------------------------------
+
+```{r packages}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(performance)
+library(patchwork)
+library(forcats)
+library(clubSandwich)
+```
+
+# ------------------------------------------------------------
+# 2. IMPORT AND PREPARE DATA
+# ------------------------------------------------------------
+
+Multiple scute subsamples from the same crocodile were averaged to obtain
+one individual-level THg concentration. Because scute material could not
+be homogenized, these measurements were treated as spatial subsamples
+rather than technical replicates of a homogenized sample.
+
+## Import Raw Data
+
+```{r import-data}
+raw <- read_excel(
+  "Bobby Data.xlsx",
+  sheet = "Data for Prism"
+)
+```
+
+
+# ------------------------------------------------------------
+# Summarize scute subsamples within each crocodile
+# ------------------------------------------------------------
+#
+# Scute material could not be homogenized before analysis.
+# Repeated measurements from the same crocodile are therefore
+# treated as spatial scute subsamples rather than conventional
+# scute subsamples of a homogeneous tissue sample.
+#
+# The mean across available scute subsamples is used as the
+# individual-level THg concentration for the PRIMARY analyses.
+# Within-individual CV is calculated for quality assessment and
+# for a separate sensitivity analysis using a 15% cutoff.
+# ------------------------------------------------------------
+
+```{r prepare-individual-data}
+dat <- raw %>%
+  group_by(`Scute ID`) %>%
+  summarise(
+    n_subsamples = sum(!is.na(`CONC [ug/kg]`)),
+    Hg_ugkg = mean(`CONC [ug/kg]`, na.rm = TRUE),
+    SD_Hg_ugkg = ifelse(
+      n_subsamples > 1,
+      sd(`CONC [ug/kg]`, na.rm = TRUE),
+      NA_real_
+    ),
+    CV_percent = ifelse(
+      n_subsamples > 1,
+      (SD_Hg_ugkg / Hg_ugkg) * 100,
+      NA_real_
+    ),
+    TL = first(`TL (cm)`),
+    SizeClass = first(`Size Class`),
+    SVL = first(`SVL (cm)`),
+    Weight = first(`Weight (g)`),
+    Sex = first(Sex),
+    Clutch = first(Clutch),
+    Site = first(`Nest Location`),
+    .groups = "drop"
+  ) %>%
+  mutate(
+     # Convert µg/kg to µg/g
+    Hg_ugg = Hg_ugkg / 1000,
+    SD_Hg_ugg = SD_Hg_ugkg / 1000,
+
+    # Sensitivity-analysis flag.
+    # Animals represented by one scute subsample are retained
+    # because within-individual CV cannot be calculated.
+    CV15_status = case_when(
+      n_subsamples == 1 ~ "Single subsample - retained",
+      CV_percent <= 15 ~ "CV <=15% - retained",
+      CV_percent > 15 ~ "CV >15% - excluded in sensitivity analysis",
+      TRUE ~ NA_character_
+    ),
+    CV15_include = n_subsamples == 1 | CV_percent <= 15,
+
+    SizeClass = factor(
+      SizeClass,
+      levels = c("Hatchling", "Juvenile", "Subadult")
+    ),
+
+    Sex = factor(Sex),
+    Clutch_f = factor(Clutch),
+    Site = factor(Site),
+
+    # Transformations used in statistical models
+    logHg = log10(Hg_ugg),
+    logSVL = log10(SVL)
+  )
+```
+
+# Inspect within-individual scute variability
+
+```{r within-individual-scute-variability}
+dat %>%
+  select(
+    `Scute ID`, SizeClass, n_subsamples,
+    Hg_ugg, SD_Hg_ugg, CV_percent, CV15_status
+  ) %>%
+  arrange(desc(CV_percent))
+```
+
+# Number retained/excluded by age class
+
+```{r retained-or-excluded-by-age-class}
+CV15_sample_summary <- dat %>%
+  count(SizeClass, CV15_status, name = "n_individuals") %>%
+  arrange(SizeClass, CV15_status)
+
+CV15_sample_summary
+```
+
+# Individuals with >15% CV
+
+```{r samples-CV-greater-than-15%}
+CV15_excluded_individuals <- dat %>%
+  filter(n_subsamples > 1, CV_percent > 15) %>%
+  select(
+    `Scute ID`, SizeClass, Sex, Clutch, Site,
+    n_subsamples, Hg_ugg, SD_Hg_ugg, CV_percent
+  ) %>%
+  arrange(SizeClass, desc(CV_percent))
+
+CV15_excluded_individuals
+```
+
+# Age-class datasets
+
+```{r age-class-datasets}
+hatchlings <- dat %>%
+  filter(SizeClass == "Hatchling") %>%
+  mutate(
+    logSVL_c = logSVL - mean(logSVL, na.rm = TRUE)
+  )
+
+juveniles <- dat %>%
+  filter(SizeClass == "Juvenile") %>%
+  mutate(
+    Sex = factor(Sex, levels = c("F", "M")),
+    logSVL_c = logSVL - mean(logSVL, na.rm = TRUE)
+  )
+```
+
+# Confirm sample sizes
+
+```{r confirm-sample-sizes}
+table(dat$SizeClass)
+table(juveniles$Sex)
+```
+
+# ============================================================
+# ANALYSIS 1. BODY SIZE AND SCUTE Hg
+# ============================================================
+
+# ------------------------------------------------------------
+# 1A. All individuals
+# ------------------------------------------------------------
+
+# Analysis 1. Body Size and Scute THg
+
+## 1A. All Individuals
+
+```{r body-size-all}
+mod_SVL_all <- lm(
+  logHg ~ logSVL,
+  data = dat
+)
+
+summary(mod_SVL_all)
+confint(mod_SVL_all)
+performance::r2(mod_SVL_all)
+performance::check_model(mod_SVL_all)
+```
+
+
+## 1B. Juveniles
+
+```{r body-size-juveniles}
+mod_SVL_juvenile <- lm(
+  logHg ~ logSVL,
+  data = juveniles
+)
+
+summary(mod_SVL_juvenile)
+confint(mod_SVL_juvenile)
+performance::r2(mod_SVL_juvenile)
+performance::check_model(mod_SVL_juvenile)
+```
+
+## 1C. Hatchlings
+
+```{r body-size-hatchlings}
+mod_SVL_hatchling <- lmer(
+  logHg ~ logSVL_c + (1 | Clutch_f),
+  data = hatchlings,
+  REML = TRUE
+)
+
+summary(mod_SVL_hatchling)
+anova(mod_SVL_hatchling)
+confint(mod_SVL_hatchling, method = "Wald")
+performance::r2(mod_SVL_hatchling)
+performance::check_model(mod_SVL_hatchling)
+```
+
+# Fixed-effect predictions for hatchling figure
+
+```{r fixed-effects-hatchlings}
+SVL_seq <- seq(
+  min(hatchlings$logSVL_c, na.rm = TRUE),
+  max(hatchlings$logSVL_c, na.rm = TRUE),
+  length.out = 200
+)
+
+pred_hatch <- emmeans(
+  mod_SVL_hatchling,
+  ~ logSVL_c,
+  at = list(logSVL_c = SVL_seq)
+) %>%
+  as.data.frame()
+
+pred_hatch$logSVL <- pred_hatch$logSVL_c +
+  mean(hatchlings$logSVL, na.rm = TRUE)
+```
+
+# ============================================================
+# ANALYSIS 2. HATCHLING CLUTCH AND NEST-SITE EFFECTS
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 2A. Sample structure
+# ------------------------------------------------------------
+
+```{r clutch-structure}
+clutch_structure <- hatchlings %>%
+  count(Site, Clutch_f, name = "n_hatchlings") %>%
+  arrange(Site, Clutch_f)
+
+clutch_structure
+```
+
+# ------------------------------------------------------------
+# 2B. Variance attributable to clutch
+# ------------------------------------------------------------
+
+```{r clutch-variance}
+mod_clutch <- lmer(
+  logHg ~ 1 + (1 | Clutch_f),
+  data = hatchlings,
+  REML = TRUE
+)
+
+summary(mod_clutch)
+
+icc_clutch <- performance::icc(
+  mod_clutch,
+  ci = 0.95
+)
+
+icc_clutch
+```
+
+# ------------------------------------------------------------
+# 2C. Nest-site effect accounting for clutch
+# ------------------------------------------------------------
+
+```{r nest-site-effect}
+mod_site_clutch <- lmer(
+  logHg ~ Site + (1 | Clutch_f),
+  data = hatchlings,
+  REML = TRUE
+)
+
+summary(mod_site_clutch)
+anova(mod_site_clutch)
+performance::r2(mod_site_clutch)
+performance::icc(mod_site_clutch, ci = 0.95)
+performance::check_singularity(mod_site_clutch)
+performance::check_model(mod_site_clutch)
+```
+
+# Estimated marginal means by site
+
+```{r EMM-by-site}
+site_emm <- emmeans(
+  mod_site_clutch,
+  ~ Site
+)
+
+site_emm
+pairs(site_emm, adjust = "tukey")
+
+site_results <- as.data.frame(
+  confint(site_emm)
+) %>%
+  mutate(
+    Hg_ugg = 10^emmean,
+    lower_Hg = 10^lower.CL,
+    upper_Hg = 10^upper.CL
+  )
+
+site_results
+```
+
+# ============================================================
+# ANALYSIS 3. JUVENILE SEX EFFECTS
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 3A. Does body size differ by sex?
+# ------------------------------------------------------------
+
+```{r juvenile-sex-effect}
+juvenile_sex_summary <- juveniles %>%
+  group_by(Sex) %>%
+  summarise(
+    n = n(),
+    mean_SVL = mean(SVL, na.rm = TRUE),
+    SD_SVL = sd(SVL, na.rm = TRUE),
+    median_SVL = median(SVL, na.rm = TRUE),
+    min_SVL = min(SVL, na.rm = TRUE),
+    max_SVL = max(SVL, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+juvenile_sex_summary
+
+sex_SVL_test <- t.test(
+  SVL ~ Sex,
+  data = juveniles
+)
+
+sex_SVL_test
+```
+
+# ------------------------------------------------------------
+# 3B. Does the Hg-SVL relationship differ by sex?
+# ------------------------------------------------------------
+
+```{r Hg-SVL-Sex}
+mod_sex_interaction <- lm(
+  logHg ~ logSVL_c * Sex,
+  data = juveniles
+)
+
+summary(mod_sex_interaction)
+anova(mod_sex_interaction)
+
+sex_slopes <- emtrends(
+  mod_sex_interaction,
+  ~ Sex,
+  var = "logSVL_c"
+)
+
+sex_slopes
+pairs(sex_slopes)
+```
+
+# ------------------------------------------------------------
+# 3C. Does sex predict Hg after accounting for SVL?
+# ------------------------------------------------------------
+
+```{r sex-adjusted-model}
+mod_sex_adjusted <- lm(
+  logHg ~ logSVL_c + Sex,
+  data = juveniles
+)
+
+summary(mod_sex_adjusted)
+anova(mod_sex_adjusted)
+confint(mod_sex_adjusted)
+performance::r2(mod_sex_adjusted)
+performance::check_model(mod_sex_adjusted)
+
+performance::check_collinearity(mod_sex_adjusted)
+```
+
+# Adjusted Hg estimates at mean juvenile body size
+
+```{r EMM-Ses}
+sex_emm <- emmeans(
+  mod_sex_adjusted,
+  ~ Sex
+)
+
+sex_results <- as.data.frame(
+  confint(sex_emm)
+) %>%
+  mutate(
+    Hg_ugg = 10^emmean,
+    lower_Hg = 10^lower.CL,
+    upper_Hg = 10^upper.CL
+  )
+
+sex_results
+pairs(sex_emm)
+```
+
+# Compare SVL-only model with SVL + sex model
+
+```{r model-comparison}
+mod_SVL_only <- lm(
+  logHg ~ logSVL_c,
+  data = juveniles
+)
+
+anova(
+  mod_SVL_only,
+  mod_sex_adjusted
+)
+```
+
+# ============================================================
+# ANALYSIS 4. HATCHLING VS. JUVENILE Hg
+# ============================================================
+
+# Subadult excluded from this two-group comparison
+
+```{r subadult-removed}
+sizeclass_dat <- dat %>%
+  filter(SizeClass %in% c("Hatchling", "Juvenile")) %>%
+  droplevels()
+```
+
+# ------------------------------------------------------------
+# 4A. Descriptive statistics
+# ------------------------------------------------------------
+
+```{r size-class-summary}
+sizeclass_summary <- sizeclass_dat %>%
+  group_by(SizeClass) %>%
+  summarise(
+    n = n(),
+    mean_Hg = mean(Hg_ugg, na.rm = TRUE),
+    SD_Hg = sd(Hg_ugg, na.rm = TRUE),
+    median_Hg = median(Hg_ugg, na.rm = TRUE),
+    min_Hg = min(Hg_ugg, na.rm = TRUE),
+    max_Hg = max(Hg_ugg, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+sizeclass_summary
+```
+
+# ------------------------------------------------------------
+# 4B. Welch's t-test on log-transformed Hg
+# ------------------------------------------------------------
+
+```{r size-class-welchs}
+sizeclass_test <- t.test(
+  logHg ~ SizeClass,
+  data = sizeclass_dat
+)
+
+sizeclass_test
+```
+
+# ------------------------------------------------------------
+# 4C. Geometric means and group-specific 95% CI
+# ------------------------------------------------------------
+
+```{r size-class-GeoMean}
+sizeclass_geo <- sizeclass_dat %>%
+  group_by(SizeClass) %>%
+  summarise(
+    n = n(),
+    mean_log = mean(logHg, na.rm = TRUE),
+    sd_log = sd(logHg, na.rm = TRUE),
+    SE_log = sd_log / sqrt(n),
+    tcrit = qt(0.975, df = n - 1),
+    
+    geometric_mean = 10^mean_log,
+    
+    lower_CI = 10^(mean_log - tcrit * SE_log),
+    upper_CI = 10^(mean_log + tcrit * SE_log),
+    
+    .groups = "drop"
+  )
+
+sizeclass_geo
+```
+
+# Juvenile:Hatchling geometric-mean ratio
+# Welch output is Hatchling - Juvenile, so signs are reversed.
+
+```{r size-class-log-ratio}
+log_ratio <- -diff(sizeclass_test$estimate)
+```
+
+# Difference in geometric means on the log10 scale
+
+```{r size-class-log-difference}
+log_difference <- (
+  mean(sizeclass_dat$logHg[sizeclass_dat$SizeClass == "Juvenile"]) -
+    mean(sizeclass_dat$logHg[sizeclass_dat$SizeClass == "Hatchling"])
+)
+```
+
+# Back-transform to obtain juvenile:hatchling ratio
+
+```{r size-class-fold-difference}
+fold_difference <- 10^log_difference
+
+fold_difference
+
+fold_CI <- 10^c(
+  -sizeclass_test$conf.int[2],
+  -sizeclass_test$conf.int[1]
+)
+
+cat(
+  "\nJuvenile:Hatchling geometric mean ratio =",
+  round(fold_difference, 2),
+  "\n95% CI =",
+  round(fold_CI[1], 2), "to",
+  round(fold_CI[2], 2),
+  "\n"
+)
+```
+
+# ============================================================
+# ANALYSIS 4D. CLUSTER-AWARE HATCHLING VS. JUVENILE COMPARISON
+# ============================================================
+#
+# Hatchlings from the same clutch are not fully independent.
+# This analysis uses CR2 cluster-robust standard errors, with
+# clutch defining the cluster for hatchlings and each juvenile
+# treated as an independent cluster.
+#
+# Requires: clubSandwich (loaded with other packages above)
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Create cluster IDs
+# ------------------------------------------------------------
+
+```{r create-cluster-IDs}
+sizeclass_cluster <- sizeclass_dat %>%
+  mutate(
+    cluster_id = if_else(
+      SizeClass == "Hatchling",
+      paste0("H_", Clutch),
+      paste0("J_", `Scute ID`)
+    )
+  )
+```
+
+# Check cluster structure
+
+```{r size-class-cluster}
+sizeclass_cluster %>%
+  count(SizeClass, cluster_id)
+```
+
+# ------------------------------------------------------------
+# Fit size-class model
+# ------------------------------------------------------------
+
+```{r fit-size-class-model}
+mod_sizeclass_cluster <- lm(
+  logHg ~ SizeClass,
+  data = sizeclass_cluster
+)
+```
+
+# ------------------------------------------------------------
+# CR2 cluster-robust inference
+# ------------------------------------------------------------
+
+```{r cluster-test}
+cluster_test <- coef_test(
+  mod_sizeclass_cluster,
+  vcov = "CR2",
+  cluster = sizeclass_cluster$cluster_id,
+  test = "Satterthwaite"
+)
+
+cluster_test
+```
+
+# Cluster-robust 95% confidence intervals
+
+```{r cluster-confidence-intervals}
+cluster_CI <- conf_int(
+  mod_sizeclass_cluster,
+  vcov = "CR2",
+  cluster = sizeclass_cluster$cluster_id,
+  test = "Satterthwaite"
+)
+
+cluster_CI
+```
+
+# ------------------------------------------------------------
+# Back-transform juvenile:hatchling effect
+# ------------------------------------------------------------
+
+# Hatchling is the reference group, so the Juvenile coefficient
+# represents log10(Juvenile Hg) - log10(Hatchling Hg).
+
+```{r}
+beta_stage <- coef(
+  mod_sizeclass_cluster
+)["SizeClassJuvenile"]
+
+fold_cluster <- 10^beta_stage
+
+fold_cluster
+```
+
+# ============================================================
+# ANALYSIS 4E. CLUTCH-LEVEL SENSITIVITY ANALYSIS
+# Compare hatchling clutch means with juvenile individuals
+# ============================================================
+#
+# This provides a simple complementary analysis in which each
+# hatchling clutch contributes one independent observation.
+# ============================================================
+
+```{r clutch-sensitivity-analysis}
+hatch_clutch_means <- hatchlings %>%
+  group_by(Clutch_f) %>%
+  summarise(
+    logHg = mean(logHg, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    SizeClass = "Hatchling"
+  )
+
+juvenile_individuals <- juveniles %>%
+  transmute(
+    logHg,
+    SizeClass = "Juvenile"
+  )
+
+sizeclass_sensitivity <- bind_rows(
+  hatch_clutch_means,
+  juvenile_individuals
+) %>%
+  mutate(
+    SizeClass = factor(
+      SizeClass,
+      levels = c("Hatchling", "Juvenile")
+    )
+  )
+
+sizeclass_sensitivity_test <- t.test(
+  logHg ~ SizeClass,
+  data = sizeclass_sensitivity
+)
+
+sizeclass_sensitivity_test
+```
+
+# ============================================================
+# ANALYSIS 5. SENSITIVITY ANALYSIS USING WITHIN-INDIVIDUAL
+# SCUTE-SUBSAMPLE CV <= 15%
+# ============================================================
+#
+# PURPOSE:
+# Determine whether the primary biological conclusions change
+# when individuals with >15% variability among multiple scute
+# subsamples are excluded.
+#
+# IMPORTANT:
+# - This does NOT replace the primary analysis.
+# - Animals represented by one scute subsample are retained,
+#   because a within-individual CV cannot be calculated.
+# - Centering and derived datasets are recreated after filtering.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 5A. Create CV-restricted individual-level dataset
+# ------------------------------------------------------------
+
+```{r CV-restricted-dataset}
+dat_CV15 <- dat %>%
+  filter(CV15_include) %>%
+  droplevels()
+
+hatchlings_CV15 <- dat_CV15 %>%
+  filter(SizeClass == "Hatchling") %>%
+  mutate(
+    Clutch_f = factor(Clutch),
+    Site = factor(Site),
+    logSVL_c = logSVL - mean(logSVL, na.rm = TRUE)
+  )
+
+juveniles_CV15 <- dat_CV15 %>%
+  filter(SizeClass == "Juvenile") %>%
+  mutate(
+    Sex = factor(Sex, levels = c("F", "M")),
+    logSVL_c = logSVL - mean(logSVL, na.rm = TRUE)
+  )
+
+CV15_n_comparison <- bind_rows(
+  dat %>%
+    count(SizeClass, name = "n") %>%
+    mutate(dataset = "Primary - all individuals"),
+  dat_CV15 %>%
+    count(SizeClass, name = "n") %>%
+    mutate(dataset = "Sensitivity - CV <=15% or single subsample")
+) %>%
+  select(dataset, SizeClass, n)
+
+CV15_n_comparison
+```
+
+# ------------------------------------------------------------
+# 5B. Body size and THg: all individuals
+# ------------------------------------------------------------
+
+```{r body-size-all-restricted}
+mod_SVL_all_CV15 <- lm(
+  logHg ~ logSVL,
+  data = dat_CV15
+)
+
+summary(mod_SVL_all_CV15)
+confint(mod_SVL_all_CV15)
+performance::r2(mod_SVL_all_CV15)
+```
+
+# ------------------------------------------------------------
+# 5C. Body size and THg: juveniles
+# ------------------------------------------------------------
+
+```{r body-size-juveniles-restricted}
+mod_SVL_juvenile_CV15 <- lm(
+  logHg ~ logSVL,
+  data = juveniles_CV15
+)
+
+summary(mod_SVL_juvenile_CV15)
+confint(mod_SVL_juvenile_CV15)
+performance::r2(mod_SVL_juvenile_CV15)
+```
+
+# ------------------------------------------------------------
+# 5D. Body size and THg: hatchlings, accounting for clutch
+# ------------------------------------------------------------
+
+```{r body-size-clutch-restricted}
+mod_SVL_hatchling_CV15 <- lmer(
+  logHg ~ logSVL_c + (1 | Clutch_f),
+  data = hatchlings_CV15,
+  REML = TRUE
+)
+
+summary(mod_SVL_hatchling_CV15)
+anova(mod_SVL_hatchling_CV15)
+confint(mod_SVL_hatchling_CV15, method = "Wald")
+performance::r2(mod_SVL_hatchling_CV15)
+```
+
+# ------------------------------------------------------------
+# 5E. Hatchling clutch ICC
+# ------------------------------------------------------------
+
+```{r clutch-ICC-restricted}
+mod_clutch_CV15 <- lmer(
+  logHg ~ 1 + (1 | Clutch_f),
+  data = hatchlings_CV15,
+  REML = TRUE
+)
+
+summary(mod_clutch_CV15)
+
+icc_clutch_CV15 <- performance::icc(
+  mod_clutch_CV15,
+  ci = 0.95
+)
+
+icc_clutch_CV15
+```
+
+# ------------------------------------------------------------
+# 5F. Hatchling nest-site effect accounting for clutch
+# ------------------------------------------------------------
+
+```{r nest-site-effect-clutch-restricted}
+mod_site_clutch_CV15 <- lmer(
+  logHg ~ Site + (1 | Clutch_f),
+  data = hatchlings_CV15,
+  REML = TRUE
+)
+
+summary(mod_site_clutch_CV15)
+anova(mod_site_clutch_CV15)
+performance::r2(mod_site_clutch_CV15)
+performance::icc(mod_site_clutch_CV15, ci = 0.95)
+performance::check_singularity(mod_site_clutch_CV15)
+
+site_emm_CV15 <- emmeans(
+  mod_site_clutch_CV15,
+  ~ Site
+)
+
+site_emm_CV15
+pairs(site_emm_CV15, adjust = "tukey")
+```
+
+# ------------------------------------------------------------
+# 5G. Juvenile sex effects
+# ------------------------------------------------------------
+
+```{r juvenile-sex-effects-restricted}
+juvenile_sex_summary_CV15 <- juveniles_CV15 %>%
+  group_by(Sex) %>%
+  summarise(
+    n = n(),
+    mean_SVL = mean(SVL, na.rm = TRUE),
+    SD_SVL = sd(SVL, na.rm = TRUE),
+    median_SVL = median(SVL, na.rm = TRUE),
+    min_SVL = min(SVL, na.rm = TRUE),
+    max_SVL = max(SVL, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+juvenile_sex_summary_CV15
+
+sex_SVL_test_CV15 <- t.test(
+  SVL ~ Sex,
+  data = juveniles_CV15
+)
+
+sex_SVL_test_CV15
+
+mod_sex_interaction_CV15 <- lm(
+  logHg ~ logSVL_c * Sex,
+  data = juveniles_CV15
+)
+
+summary(mod_sex_interaction_CV15)
+anova(mod_sex_interaction_CV15)
+
+sex_slopes_CV15 <- emtrends(
+  mod_sex_interaction_CV15,
+  ~ Sex,
+  var = "logSVL_c"
+)
+
+sex_slopes_CV15
+pairs(sex_slopes_CV15)
+
+mod_sex_adjusted_CV15 <- lm(
+  logHg ~ logSVL_c + Sex,
+  data = juveniles_CV15
+)
+
+summary(mod_sex_adjusted_CV15)
+anova(mod_sex_adjusted_CV15)
+confint(mod_sex_adjusted_CV15)
+performance::r2(mod_sex_adjusted_CV15)
+
+sex_emm_CV15 <- emmeans(
+  mod_sex_adjusted_CV15,
+  ~ Sex
+)
+
+sex_emm_CV15
+pairs(sex_emm_CV15)
+
+```
+
+# ------------------------------------------------------------
+# 5H. Hatchling vs juvenile age-class comparison:
+# CR2 cluster-robust inference
+# ------------------------------------------------------------
+
+```{r age-class-comparison-restricted}
+sizeclass_CV15 <- dat_CV15 %>%
+  filter(SizeClass %in% c("Hatchling", "Juvenile")) %>%
+  droplevels() %>%
+  mutate(
+    SizeClass = factor(
+      SizeClass,
+      levels = c("Hatchling", "Juvenile")
+    ),
+    cluster_id = if_else(
+      SizeClass == "Hatchling",
+      paste0("H_", Clutch),
+      paste0("J_", `Scute ID`)
+    )
+  )
+
+mod_sizeclass_cluster_CV15 <- lm(
+  logHg ~ SizeClass,
+  data = sizeclass_CV15
+)
+
+cluster_test_CV15 <- coef_test(
+  mod_sizeclass_cluster_CV15,
+  vcov = "CR2",
+  cluster = sizeclass_CV15$cluster_id,
+  test = "Satterthwaite"
+)
+
+cluster_test_CV15
+
+cluster_CI_CV15 <- conf_int(
+  mod_sizeclass_cluster_CV15,
+  vcov = "CR2",
+  cluster = sizeclass_CV15$cluster_id,
+  test = "Satterthwaite"
+)
+
+cluster_CI_CV15
+
+beta_stage_CV15 <- coef(
+  mod_sizeclass_cluster_CV15
+)["SizeClassJuvenile"]
+
+fold_cluster_CV15 <- 10^beta_stage_CV15
+
+fold_cluster_CV15
+
+```
+
+# ------------------------------------------------------------
+# 5I. Clutch-mean sensitivity within CV-restricted dataset
+# ------------------------------------------------------------
+
+```{r clutch-mean-sensitivity-restricted}
+hatch_clutch_means_CV15 <- hatchlings_CV15 %>%
+  group_by(Clutch_f) %>%
+  summarise(
+    logHg = mean(logHg, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    SizeClass = "Hatchling"
+  )
+
+juvenile_individuals_CV15 <- juveniles_CV15 %>%
+  transmute(
+    logHg,
+    SizeClass = "Juvenile"
+  )
+
+sizeclass_clutchmean_CV15 <- bind_rows(
+  hatch_clutch_means_CV15,
+  juvenile_individuals_CV15
+) %>%
+  mutate(
+    SizeClass = factor(
+      SizeClass,
+      levels = c("Hatchling", "Juvenile")
+    )
+  )
+
+sizeclass_clutchmean_test_CV15 <- t.test(
+  logHg ~ SizeClass,
+  data = sizeclass_clutchmean_CV15
+)
+
+sizeclass_clutchmean_test_CV15
+```
+
+# ------------------------------------------------------------
+# 5J. Compact primary vs CV15 model summary
+# ------------------------------------------------------------
+
+```{r primary-vs-restricted-model-summary}
+CV15_model_summary <- bind_rows(
+
+  data.frame(
+    Analysis = "All animals: THg ~ SVL",
+    Dataset = "Primary",
+    N = nobs(mod_SVL_all),
+    Estimate = coef(mod_SVL_all)["logSVL"],
+    P_value = coef(summary(mod_SVL_all))["logSVL", "Pr(>|t|)"],
+    R2 = summary(mod_SVL_all)$r.squared
+  ),
+
+  data.frame(
+    Analysis = "All animals: THg ~ SVL",
+    Dataset = "CV15 sensitivity",
+    N = nobs(mod_SVL_all_CV15),
+    Estimate = coef(mod_SVL_all_CV15)["logSVL"],
+    P_value = coef(summary(mod_SVL_all_CV15))["logSVL", "Pr(>|t|)"],
+    R2 = summary(mod_SVL_all_CV15)$r.squared
+  ),
+
+  data.frame(
+    Analysis = "Juveniles: THg ~ SVL",
+    Dataset = "Primary",
+    N = nobs(mod_SVL_juvenile),
+    Estimate = coef(mod_SVL_juvenile)["logSVL"],
+    P_value = coef(summary(mod_SVL_juvenile))["logSVL", "Pr(>|t|)"],
+    R2 = summary(mod_SVL_juvenile)$r.squared
+  ),
+
+  data.frame(
+    Analysis = "Juveniles: THg ~ SVL",
+    Dataset = "CV15 sensitivity",
+    N = nobs(mod_SVL_juvenile_CV15),
+    Estimate = coef(mod_SVL_juvenile_CV15)["logSVL"],
+    P_value = coef(summary(mod_SVL_juvenile_CV15))["logSVL", "Pr(>|t|)"],
+    R2 = summary(mod_SVL_juvenile_CV15)$r.squared
+  ),
+
+  data.frame(
+    Analysis = "Hatchlings: THg ~ SVL + clutch",
+    Dataset = "Primary",
+    N = nobs(mod_SVL_hatchling),
+    Estimate = fixef(mod_SVL_hatchling)["logSVL_c"],
+    P_value = anova(mod_SVL_hatchling)["logSVL_c", "Pr(>F)"],
+    R2 = performance::r2(mod_SVL_hatchling)$R2_marginal
+  ),
+
+  data.frame(
+    Analysis = "Hatchlings: THg ~ SVL + clutch",
+    Dataset = "CV15 sensitivity",
+    N = nobs(mod_SVL_hatchling_CV15),
+    Estimate = fixef(mod_SVL_hatchling_CV15)["logSVL_c"],
+    P_value = anova(mod_SVL_hatchling_CV15)["logSVL_c", "Pr(>F)"],
+    R2 = performance::r2(mod_SVL_hatchling_CV15)$R2_marginal
+  ),
+
+  data.frame(
+    Analysis = "Juveniles: sex adjusted for SVL",
+    Dataset = "Primary",
+    N = nobs(mod_sex_adjusted),
+    Estimate = coef(mod_sex_adjusted)["SexM"],
+    P_value = coef(summary(mod_sex_adjusted))["SexM", "Pr(>|t|)"],
+    R2 = summary(mod_sex_adjusted)$r.squared
+  ),
+
+  data.frame(
+    Analysis = "Juveniles: sex adjusted for SVL",
+    Dataset = "CV15 sensitivity",
+    N = nobs(mod_sex_adjusted_CV15),
+    Estimate = coef(mod_sex_adjusted_CV15)["SexM"],
+    P_value = coef(summary(mod_sex_adjusted_CV15))["SexM", "Pr(>|t|)"],
+    R2 = summary(mod_sex_adjusted_CV15)$r.squared
+  )
+)
+
+CV15_model_summary
+
+cat(
+  "\nPRIMARY juvenile:hatchling CR2 fold difference =",
+  round(fold_cluster, 2),
+  "\nCV15 juvenile:hatchling CR2 fold difference =",
+  round(fold_cluster_CV15, 2),
+  "\n"
+)
+
+cat("\nPRIMARY hatchling clutch ICC:\n")
+print(icc_clutch)
+
+cat("\nCV15 hatchling clutch ICC:\n")
+print(icc_clutch_CV15)
+
+cat("\nPRIMARY nest-site omnibus test:\n")
+print(anova(mod_site_clutch))
+
+cat("\nCV15 nest-site omnibus test:\n")
+print(anova(mod_site_clutch_CV15))
+
+```
+
+# ============================================================
+# 6. FIGURES
+# ============================================================
+
+
+# ============================================================
+# FIGURE 2. BODY SIZE AND SIZE-CLASS PATTERNS
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Statistical labels
+# ------------------------------------------------------------
+
+```{r summary-SVL-all}
+sum_all <- summary(mod_SVL_all)
+
+label_all <- paste0(
+  "R² = ", sprintf("%.3f", sum_all$r.squared), "\n",
+  ifelse(
+    coef(sum_all)["logSVL", "Pr(>|t|)"] < 0.0001,
+    "p < 0.0001",
+    paste0(
+      "p = ",
+      sprintf("%.3f", coef(sum_all)["logSVL", "Pr(>|t|)"])
+    )
+  )
+)
+
+
+sum_juv <- summary(mod_SVL_juvenile)
+
+label_juv <- paste0(
+  "R² = ", sprintf("%.3f", sum_juv$r.squared), "\n",
+  ifelse(
+    coef(sum_juv)["logSVL", "Pr(>|t|)"] < 0.0001,
+    "p < 0.0001",
+    paste0(
+      "p = ",
+      sprintf("%.3f", coef(sum_juv)["logSVL", "Pr(>|t|)"])
+    )
+  )
+)
+
+
+R2_hatch <- performance::r2(
+  mod_SVL_hatchling
+)$R2_marginal
+
+p_hatch <- anova(
+  mod_SVL_hatchling
+)["logSVL_c", "Pr(>F)"]
+
+label_hatch <- paste0(
+  "Marginal R² = ", sprintf("%.3f", R2_hatch), "\n",
+  "p = ", sprintf("%.3f", p_hatch)
+)
+```
+
+# ------------------------------------------------------------
+# Colors for age class
+# ------------------------------------------------------------
+
+```{r age-class-colors}
+age_colors <- c(
+  "Hatchling" = "#56B4E9",
+  "Juvenile"  = "#D55E00"
+)
+```
+
+# ------------------------------------------------------------
+# Panel A: All individuals
+# ------------------------------------------------------------
+
+```{r Figure-2-Panel-A}
+pA <- ggplot(
+  dat,
+  aes(logSVL, logHg)
+) +
+  geom_point(
+    size = 2.3,
+    alpha = 0.75
+  ) +
+  geom_smooth(
+    method = "lm",
+    formula = y ~ x,
+    se = TRUE,
+    linewidth = 0.9
+  ) +
+  annotate(
+    "text",
+    x = -Inf,
+    y = Inf,
+    label = label_all,
+    hjust = -0.12,
+    vjust = 1.25,
+    size = 4
+  ) +
+  labs(
+    title = "THg by Body Size in All Animals",
+    x = expression(Log[10]~"SVL (cm)"),
+    y = expression(Log[10]~"scute THg (" * mu * "g/g)")
+  ) +
+  theme_classic(base_size = 12)
+```
+
+# ------------------------------------------------------------
+# Panel B: Juveniles
+# ------------------------------------------------------------
+
+```{r Figure-2-Panel-B}
+pB <- ggplot(
+  juveniles,
+  aes(logSVL, logHg)
+) +
+  geom_point(
+    size = 2.3,
+    alpha = 0.75
+  ) +
+  geom_smooth(
+    method = "lm",
+    formula = y ~ x,
+    se = TRUE,
+    linewidth = 0.9
+  ) +
+  annotate(
+    "text",
+    x = -Inf,
+    y = Inf,
+    label = label_juv,
+    hjust = -0.12,
+    vjust = 1.25,
+    size = 4
+  ) +
+  labs(
+    title = "THg by Body Size in Juveniles",
+    x = expression(Log[10]~"SVL (cm)"),
+    y = expression(Log[10]~"scute THg (" * mu * "g/g)")
+  ) +
+  theme_classic(base_size = 12)
+```
+
+# ------------------------------------------------------------
+# Panel C: Hatchlings
+# ------------------------------------------------------------
+
+```{r Figure-2-Panel-C}
+pC <- ggplot(
+  hatchlings,
+  aes(logSVL, logHg)
+) +
+  geom_point(
+    size = 2.3,
+    alpha = 0.75
+  ) +
+  geom_ribbon(
+    data = pred_hatch,
+    aes(
+      x = logSVL,
+      ymin = lower.CL,
+      ymax = upper.CL
+    ),
+    inherit.aes = FALSE,
+    alpha = 0.20
+  ) +
+  geom_line(
+    data = pred_hatch,
+    aes(
+      x = logSVL,
+      y = emmean
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.9
+  ) +
+  annotate(
+    "text",
+    x = -Inf,
+    y = Inf,
+    label = label_hatch,
+    hjust = -0.12,
+    vjust = 1.25,
+    size = 4
+  ) +
+  labs(
+    title = "THg by Body Size in Hatchlings",
+    x = expression(Log[10]~"SVL (cm)"),
+    y = expression(Log[10]~"scute THg (" * mu * "g/g)")
+  ) +
+  theme_classic(base_size = 12)
+```
+
+# ------------------------------------------------------------
+# Panel D: Hatchling vs juvenile THg
+# ------------------------------------------------------------
+
+```{r Figure-2-Panel-D}
+pD <- ggplot(
+  sizeclass_dat,
+  aes(
+    x = SizeClass,
+    y = Hg_ugg,
+    fill = SizeClass
+  )
+) +
+  geom_boxplot(
+    width = 0.55,
+    alpha = 0.45,
+    outlier.shape = NA,
+    linewidth = 0.8
+  ) +
+  geom_jitter(
+    aes(color = SizeClass),
+    width = 0.12,
+    height = 0,
+    size = 2.5,
+    alpha = 0.75
+  ) +
+  scale_fill_manual(values = age_colors) +
+  scale_color_manual(values = age_colors) +
+  
+  # Descriptive juvenile:hatchling geometric mean ratio
+  annotate(
+    "text",
+    x = 1.5,
+    y = max(sizeclass_dat$Hg_ugg, na.rm = TRUE) * 1.08,
+    label = paste0(
+      sprintf("%.2f", fold_difference),
+      "-fold higher\nin juveniles"
+    ),
+    size = 4.0
+  ) +
+  
+  labs(
+    title = "THg by Age Class",
+    x = NULL,
+    y = expression("Scute THg (" * mu * "g/g)")
+  ) +
+  
+  guides(
+    fill = "none",
+    color = "none"
+  ) +
+  
+  scale_y_continuous(
+    expand = expansion(mult = c(0.05, 0.18))
+  ) +
+  
+  theme_classic(base_size = 12) +
+  
+  theme(
+    axis.text.x = element_text(
+      face = "bold",
+      color = "black"
+    )
+  )
+
+```
+
+# ------------------------------------------------------------
+# Combine Figure 2 panels
+# ------------------------------------------------------------
+
+```{r assemble-Figure-2}
+figure2 <- (
+  pA + pB
+) / (
+  pC + pD
+) +
+  plot_annotation(
+    tag_levels = "A",
+    title = "Body Size and Age-Class Patterns in Scute Mercury Concentrations"
+  ) &
+  theme(
+    plot.tag = element_text(
+      face = "bold",
+      size = 14
+    ),
+    plot.title = element_text(
+      face = "bold"
+    )
+  )
+
+figure2
+```
+
+# ============================================================
+# FIGURE 3. HATCHLING CLUTCH AND NEST-SITE VARIATION
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Prepare hatchling plotting data
+# ------------------------------------------------------------
+
+```{r clutch-nest-site-variation}
+hatchlings_plot <- hatchlings %>%
+  mutate(
+    Site_short = fct_recode(
+      Site,
+      "Playita" = "Isla Cabritos (Playita)",
+      "Punte Oeste" = "Isla Cabritos (Punte Oeste)",
+      "KM 5" = "KM 5",
+      "Las Azufradas" = "Las Azufradas (La Charca)"
+    ),
+    
+    Site_short = factor(
+      Site_short,
+      levels = c(
+        "Playita",
+        "Punte Oeste",
+        "KM 5",
+        "Las Azufradas"
+      )
+    ),
+    
+    Clutch_f = factor(
+      Clutch_f,
+      levels = c(
+        "1", "3", "4", "5",
+        "6", "7", "8", "9"
+      )
+    )
+  )
+```
+
+# ------------------------------------------------------------
+# Nest-site colors used only in Panel B
+# ------------------------------------------------------------
+
+```{r nest-site-colors}
+site_colors <- c(
+  "Playita" = "#0072B2",
+  "Punte Oeste" = "#D55E00",
+  "KM 5" = "#009E73",
+  "Las Azufradas" = "#CC79A7"
+)
+```
+
+# ------------------------------------------------------------
+# Clutch-specific symbols used consistently in Panels A and B
+# ------------------------------------------------------------
+
+```{r clutch-specific-symbols}
+clutch_shapes <- c(
+  "1" = 16,
+  "3" = 17,
+  "4" = 15,
+  "5" = 3,
+  "6" = 4,
+  "7" = 8,
+  "8" = 18,
+  "9" = 7
+)
+```
+
+# ------------------------------------------------------------
+# Unique clutch colors used only in Panel A
+# Chosen to be distinct from the site palette in Panel B
+# ------------------------------------------------------------
+
+```{r clutch-colors}
+clutch_colors <- c(
+  "1" = "#332288",
+  "3" = "#88CCEE",
+  "4" = "#44AA99",
+  "5" = "#117733",
+  "6" = "#999933",
+  "7" = "#DDCC77",
+  "8" = "#AA4499",
+  "9" = "#882255"
+)
+```
+
+# ============================================================
+# Panel A: Hatchling THg by clutch
+# Color + shape both identify clutch
+# ============================================================
+
+```{r Figure-3-Panel-A}
+p3A <- ggplot(
+  hatchlings_plot,
+  aes(
+    x = Clutch_f,
+    y = Hg_ugg,
+    fill = Clutch_f,
+    color = Clutch_f,
+    shape = Clutch_f
+  )
+) +
+  
+  geom_boxplot(
+    width = 0.60,
+    alpha = 0.30,
+    outlier.shape = NA,
+    linewidth = 0.8
+  ) +
+  
+  geom_jitter(
+    width = 0.10,
+    height = 0,
+    size = 2.8,
+    alpha = 0.85
+  ) +
+  
+  scale_fill_manual(
+    values = clutch_colors
+  ) +
+  
+  scale_color_manual(
+    values = clutch_colors
+  ) +
+  
+  scale_shape_manual(
+    values = clutch_shapes
+  ) +
+  
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    label = "ICC = 0.479",
+    hjust = 1.10,
+    vjust = 1.30,
+    size = 4
+  ) +
+  
+  labs(
+    title = "Clutch-Level Variation",
+    x = "Clutch",
+    y = expression("Scute THg (" * mu * "g/g)")
+  ) +
+  
+  guides(
+    fill = "none",
+    color = "none",
+    shape = "none"
+  ) +
+  
+  theme_classic(base_size = 12)
+```
+
+# ============================================================
+# Panel B: Hatchling THg by nest site and clutch
+# Color = nest site
+# Shape = clutch
+# ============================================================
+
+```{r Figure-3-Panel-B}
+p3B <- ggplot(
+  hatchlings_plot,
+  aes(
+    x = Site_short,
+    y = Hg_ugg,
+    fill = Site_short
+  )
+) +
+  
+  geom_boxplot(
+    width = 0.60,
+    alpha = 0.35,
+    outlier.shape = NA,
+    linewidth = 0.8
+  ) +
+  
+  geom_jitter(
+    aes(
+      color = Site_short,
+      shape = Clutch_f
+    ),
+    width = 0.13,
+    height = 0,
+    size = 2.8,
+    alpha = 0.90
+  ) +
+  
+  scale_fill_manual(
+    values = site_colors
+  ) +
+  
+  scale_color_manual(
+    values = site_colors
+  ) +
+  
+  scale_shape_manual(
+    values = clutch_shapes
+  ) +
+  
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    label = "Site: p = 0.151",
+    hjust = 1.10,
+    vjust = 1.30,
+    size = 4
+  ) +
+  
+  labs(
+    title = "Nest Site and Clutch",
+    x = "Nest site",
+    y = expression("Scute THg (" * mu * "g/g)"),
+    shape = "Clutch"
+  ) +
+  
+  guides(
+    fill = "none",
+    color = "none",
+    shape = guide_legend(
+      title = "Clutch",
+      override.aes = list(
+        color = "black",
+        size = 3.5,
+        alpha = 1
+      )
+    )
+  ) +
+  
+  theme_classic(base_size = 12) +
+  
+  theme(
+    axis.text.x = element_text(
+      angle = 25,
+      hjust = 1
+    )
+  )
+
+```
+
+# ============================================================
+# Combine Figure 3
+# ============================================================
+
+```{r assemble-Figure-3}
+figure3 <- p3A + p3B +
+  plot_annotation(
+    tag_levels = "A",
+    title = "Clutch and Nest-Site Variation in Hatchling Scute Mercury"
+  ) &
+  theme(
+    plot.tag = element_text(
+      face = "bold",
+      size = 14
+    ),
+    plot.title = element_text(
+      face = "bold"
+    )
+  )
+
+figure3
+```
+
+# ============================================================
+# 7. SAVE OUTPUTS
+# ============================================================
+
+```{r save-outputs}
+write.csv(
+  clutch_structure,
+  "Hatchling_Clutch_Structure.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  site_results,
+  "Nest_Site_Estimated_Hg.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  juvenile_sex_summary,
+  "Juvenile_Sex_Summary.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  sex_results,
+  "Juvenile_Sex_Adjusted_Hg.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  sizeclass_summary,
+  "SizeClass_Hg_Summary.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  sizeclass_geo,
+  "SizeClass_Geometric_Means.csv",
+  row.names = FALSE
+)
+```
+
+# ------------------------------------------------------------
+# Save CV sensitivity-analysis outputs
+# ------------------------------------------------------------
+
+```{r sensitivity-analysis-outputs}
+write.csv(
+  dat %>%
+    select(
+      `Scute ID`, SizeClass, Sex, Clutch, Site,
+      n_subsamples, Hg_ugg, SD_Hg_ugg,
+      CV_percent, CV15_status, CV15_include
+    ),
+  "Scute_Subsample_CV_by_Individual.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  CV15_sample_summary,
+  "CV15_Sample_Summary.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  CV15_excluded_individuals,
+  "CV15_Excluded_Individuals.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  CV15_n_comparison,
+  "CV15_Primary_vs_Sensitivity_Sample_Sizes.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  CV15_model_summary,
+  "CV15_Primary_vs_Sensitivity_Model_Summary.csv",
+  row.names = FALSE
+)
+```
+
+# ------------------------------------------------------------
+# Save Figure 2
+# ------------------------------------------------------------
+
+```{r save-Figure-2}
+ggsave(
+  "Figure2_BodySize_SizeClass.tiff",
+  figure2,
+  width = 11,
+  height = 8,
+  units = "in",
+  dpi = 600,
+  compression = "lzw"
+)
+```
+
+## ------------------------------------------------------------
+## Save Figure 3
+## ------------------------------------------------------------
+
+```{r save-Figure-3}
+ggsave(
+  "Figure3_Clutch_NestSite.tiff",
+  figure3,
+  width = 10,
+  height = 5,
+  units = "in",
+  dpi = 600,
+  compression = "lzw"
+)
+```
+
+
